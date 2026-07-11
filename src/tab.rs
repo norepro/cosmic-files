@@ -78,9 +78,13 @@ const MAX_SEARCH_RESULTS: usize = 200;
 const THUMBNAIL_SIZE: u32 = (ICON_SIZE_GRID as u32) * (ICON_SCALE_MAX as u32);
 /// Maximum bytes of text to pass to the editor for preview; caps shaping work to avoid blocking.
 /// Files larger than this get a truncated preview (first N bytes only).
-const TEXT_PREVIEW_MAX_BYTES: usize = 256 * 1024; // 256 KiB
+const TEXT_PREVIEW_MAX_BYTES: usize = 16 * 1024; // 16 KiB
 /// Maximum file size (bytes) to attempt text preview; files larger than this are skipped entirely.
 const TEXT_PREVIEW_MAX_FILE_BYTES: u64 = 8 * 1000 * 1000; // 8 MiB
+/// Maximum bytes allowed in a single line of a text preview.
+const TEXT_PREVIEW_MAX_LINE_BYTES: usize = 1024;
+/// Maximum number of lines to keep in a text preview.
+const TEXT_PREVIEW_MAX_LINES: usize = 128;
 
 // Thumbnail generation semaphore - limits parallel thumbnail workers
 // Uses 4 workers for balanced throughput and memory usage
@@ -1947,6 +1951,39 @@ impl Clone for ItemThumbnail {
     }
 }
 
+/// Returns the byte index at which to cut preview text. The scanning stops after
+/// [`TEXT_PREVIEW_MAX_LINES`] lines or hitting a line exceeding
+/// [`TEXT_PREVIEW_MAX_LINE_BYTES`]. In the latter case, the line is truncated
+/// and all remaining characters are excluded. The returned index is always a
+/// UTF-8 char boundary.
+fn text_preview_cut(text: &str) -> usize {
+    if text.len() <= TEXT_PREVIEW_MAX_LINE_BYTES {
+        return text.len();
+    }
+    let mut col = 0usize;
+    let mut lines = 0usize;
+    for (i, byte) in text.bytes().enumerate() {
+        if byte == b'\n' {
+            lines += 1;
+            if lines >= TEXT_PREVIEW_MAX_LINES {
+                return i;
+            }
+            col = 0;
+        } else {
+            col += 1;
+            if col > TEXT_PREVIEW_MAX_LINE_BYTES {
+                // Ensure we cut on a valid boundary.
+                let mut cut = i;
+                while cut > 0 && !text.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                return cut;
+            }
+        }
+    }
+    text.len()
+}
+
 impl ItemThumbnail {
     pub fn new(
         path: &Path,
@@ -2153,16 +2190,13 @@ impl ItemThumbnail {
                 }) {
                     Ok(()) => {
                         let text = match std::str::from_utf8(&buf) {
-                            Ok(s) => s.to_string(),
-                            Err(e) => {
-                                // Use only the valid UTF-8 prefix (slice is guaranteed valid by valid_up_to())
-                                std::str::from_utf8(&buf[..e.valid_up_to()])
-                                    .unwrap_or("")
-                                    .to_string()
-                            }
+                            Ok(s) => s,
+                            // Use only the valid UTF-8 prefix (slice is guaranteed valid by valid_up_to())
+                            Err(e) => std::str::from_utf8(&buf[..e.valid_up_to()]).unwrap_or(""),
                         };
+                        let text = &text[..text_preview_cut(text)];
                         if !text.is_empty() {
-                            return Self::Text(widget::text_editor::Content::with_text(&text));
+                            return Self::Text(widget::text_editor::Content::with_text(text));
                         }
                     }
                     Err(err) => {
@@ -7391,7 +7425,8 @@ mod tests {
     use test_log::test;
 
     use super::{
-        ItemMetadata, ItemThumbnail, Location, Message, Tab, respond_to_scroll_direction, scan_path,
+        ItemMetadata, ItemThumbnail, Location, Message, TEXT_PREVIEW_MAX_LINE_BYTES,
+        TEXT_PREVIEW_MAX_LINES, Tab, respond_to_scroll_direction, scan_path, text_preview_cut,
     };
     use crate::app::test_utils::{
         NAME_LEN, NUM_DIRS, NUM_FILES, NUM_HIDDEN, NUM_NESTED, assert_eq_tab_path, empty_fs,
@@ -7892,6 +7927,82 @@ mod tests {
                 "expected Text thumbnail with valid prefix only, got {:?}",
                 thumb
             ),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn text_preview_cut_keeps_short_text_whole() {
+        let text = "a\nb\nc\n";
+        assert_eq!(text_preview_cut(text), text.len());
+    }
+
+    #[test]
+    fn text_preview_cut_bounds_single_long_line() {
+        let text = "x".repeat(TEXT_PREVIEW_MAX_LINE_BYTES * 4);
+        let cut = text_preview_cut(&text);
+        assert_eq!(cut, TEXT_PREVIEW_MAX_LINE_BYTES);
+        assert!(!text[..cut].is_empty());
+    }
+
+    #[test]
+    fn text_preview_cut_bounds_line_count() {
+        // Many short lines, well past the line cap; the byte cap never triggers.
+        let text = "abc\n".repeat(TEXT_PREVIEW_MAX_LINES * 4);
+        let cut = text_preview_cut(&text);
+        assert!(cut < text.len());
+        assert_eq!(text[..cut].lines().count(), TEXT_PREVIEW_MAX_LINES);
+    }
+
+    #[test]
+    fn text_preview_cut_keeps_short_lines_before_long_line() {
+        let prefix = "a\nb\nc\n";
+        let text = format!("{prefix}{}", "z".repeat(TEXT_PREVIEW_MAX_LINE_BYTES * 4));
+        let cut = text_preview_cut(&text);
+        assert_eq!(cut, prefix.len() + TEXT_PREVIEW_MAX_LINE_BYTES);
+        assert!(text[..cut].starts_with(prefix));
+    }
+
+    #[test]
+    fn text_preview_cut_backs_off_to_char_boundary() {
+        // Fill with single characters until max - 1, then a double-byte character.
+        let mut text = "a".repeat(TEXT_PREVIEW_MAX_LINE_BYTES - 1);
+        text.push('é');
+        let cut = text_preview_cut(&text);
+        assert_eq!(cut, TEXT_PREVIEW_MAX_LINE_BYTES - 1);
+        assert!(text.is_char_boundary(cut));
+        assert_eq!(&text[..cut], "a".repeat(TEXT_PREVIEW_MAX_LINE_BYTES - 1));
+    }
+
+    #[test]
+    fn item_thumbnail_text_preview_single_long_line_is_bounded() -> io::Result<()> {
+        let dir = TempDir::new()?;
+        let path = dir.path().join("one_line.txt");
+        fs::write(&path, "y".repeat(300 * 1024))?;
+        let metadata = fs::metadata(&path)?;
+        let item_metadata = ItemMetadata::Path {
+            metadata,
+            children_opt: None,
+        };
+        let thumb = ItemThumbnail::new(
+            &path,
+            item_metadata,
+            mime::TEXT_PLAIN,
+            128,
+            100 * 1024 * 1024,
+            1,
+            8,
+        );
+        match &thumb {
+            ItemThumbnail::Text(content) => {
+                let text = content.text();
+                assert!(
+                    text.trim_end().len() <= TEXT_PREVIEW_MAX_LINE_BYTES,
+                    "single-line preview must be bounded to the per-line cap, got {} bytes",
+                    text.trim_end().len()
+                );
+            }
+            _ => panic!("expected bounded Text thumbnail, got {:?}", thumb),
         }
         Ok(())
     }
